@@ -8,10 +8,10 @@ import (
 )
 
 type DoHConfig struct {
-	ListenAddrs  []ListenAddr
 	KnownProxies map[string]struct{}
-	HTTPWorkers  int64
+	ListenAddrs  []ListenAddr
 	DNSResolvers []DNSResolver
+	HTTPWorkers  int64
 	Debug        bool
 }
 
@@ -26,6 +26,8 @@ type DNSResolver struct {
 	Net  string
 	Addr string
 }
+
+type ContextKey string
 
 const (
 	ListDelimiter  = ";"

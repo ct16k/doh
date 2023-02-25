@@ -2,12 +2,14 @@ package gateways
 
 import (
 	"context"
-	"doh/domain"
 	"fmt"
-	"github.com/miekg/dns"
 	"log"
 	"math"
 	"math/rand"
+
+	"doh/domain"
+
+	"github.com/miekg/dns"
 )
 
 type DNSClient struct {
@@ -29,9 +31,7 @@ func NewDNSClient(ctx context.Context) *DNSClient {
 		config: config,
 	}
 
-	for _, dnsResolver := range config.DNSResolvers {
-		dnsClient.resolvers = append(dnsClient.resolvers, dnsResolver)
-	}
+	dnsClient.resolvers = append(dnsClient.resolvers, config.DNSResolvers...)
 	dnsClient.resolverCount = len(dnsClient.resolvers)
 
 	return dnsClient

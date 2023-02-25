@@ -4,20 +4,23 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"doh/domain"
-	"doh/gateways"
 	"encoding/base64"
 	"fmt"
-	"golang.org/x/sync/semaphore"
-	"io/ioutil"
+	"io"
 	"log"
 	"math"
 	"net/http"
+	"os"
 	"strconv"
+
+	"doh/domain"
+	"doh/gateways"
+
+	"golang.org/x/sync/semaphore"
 )
 
 type HTTPServer struct {
-	server   http.Server
+	server   *http.Server
 	certFile string
 	keyFile  string
 }
@@ -25,9 +28,9 @@ type HTTPServer struct {
 type DoHServer struct {
 	ctx           context.Context
 	config        *domain.DoHConfig
-	servers       []HTTPServer
 	httpSemaphore *semaphore.Weighted
 	dnsClient     *gateways.DNSClient
+	servers       []HTTPServer
 }
 
 func NewDoHServer(ctx context.Context) *DoHServer {
@@ -44,7 +47,7 @@ func NewDoHServer(ctx context.Context) *DoHServer {
 			Addr: listenAddr.Addr,
 		}
 		if listenAddr.ClientCAs != "" {
-			caCerts, err := ioutil.ReadFile(listenAddr.ClientCAs)
+			caCerts, err := os.ReadFile(listenAddr.ClientCAs)
 			if err != nil {
 				log.Fatalf("could not read client CAs: %v", err)
 			}
@@ -59,16 +62,15 @@ func NewDoHServer(ctx context.Context) *DoHServer {
 				ClientCAs:  caCertPool,
 				ClientAuth: tls.RequireAndVerifyClientCert,
 			}
-			tlsConfig.BuildNameToCertificate()
 
 			server.TLSConfig = tlsConfig
 			if config.Debug {
-				log.Printf("%#v", *tlsConfig)
+				log.Printf("%#v", tlsConfig)
 			}
 		}
 
 		dohServer.servers = append(dohServer.servers, HTTPServer{
-			server:   server,
+			server:   &server,
 			certFile: listenAddr.CertFile,
 			keyFile:  listenAddr.KeyFile,
 		})
@@ -102,7 +104,9 @@ func (s *DoHServer) Start() {
 func (s *DoHServer) Stop() {
 	for _, srv := range s.servers {
 		log.Printf("Stopping %s server...\n", srv.server.Addr)
-		srv.server.Shutdown(s.ctx)
+		if err := srv.server.Shutdown(s.ctx); err != nil {
+			log.Printf("Error stopping service: %v\n", err)
+		}
 	}
 	log.Println("Stopped.")
 
@@ -110,7 +114,13 @@ func (s *DoHServer) Stop() {
 }
 
 func (s *DoHServer) requestHandler(w http.ResponseWriter, r *http.Request) {
-	s.httpSemaphore.Acquire(s.ctx, 1)
+	var err error
+
+	if err = s.httpSemaphore.Acquire(s.ctx, 1); err != nil {
+		log.Printf("error acquiring request semaphore: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	defer s.httpSemaphore.Release(1)
 
 	if s.config.Debug {
@@ -123,7 +133,6 @@ func (s *DoHServer) requestHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body []byte
-	var err error
 	if r.Method == "GET" {
 		query, ok := r.URL.Query()["dns"]
 		if ok && (len(query) == 1) {
@@ -136,7 +145,7 @@ func (s *DoHServer) requestHandler(w http.ResponseWriter, r *http.Request) {
 		if (contentType != "") && (contentType != "application/dns-message") {
 			err = fmt.Errorf("unknown body MIME type")
 		} else {
-			body, err = ioutil.ReadAll(r.Body)
+			body, err = io.ReadAll(r.Body)
 			if err == nil {
 				bodyLen := len(body)
 				if bodyLen == 0 {

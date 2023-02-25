@@ -2,10 +2,11 @@ package main
 
 import (
 	"context"
-	"doh/domain"
 	"log"
 	"os"
 	"os/signal"
+
+	"doh/domain"
 )
 
 func main() {
@@ -16,7 +17,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("error reading config: %v", err)
 	}
-	ctx = context.WithValue(ctx, "config", conf)
+	ctx = context.WithValue(ctx, domain.ContextKey("config"), conf)
 
 	srv := NewDoHServer(ctx)
 	if conf.Debug {
@@ -26,7 +27,7 @@ func main() {
 
 	srv.Start()
 
-	signalChan := make(chan os.Signal)
+	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, os.Interrupt)
 	select {
 	case <-signalChan:
