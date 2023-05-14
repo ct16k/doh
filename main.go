@@ -6,23 +6,24 @@ import (
 	"os"
 	"os/signal"
 
-	"doh/domain"
+	"doh/config"
 )
 
 func main() {
 	ctx := context.Background()
 	log.SetFlags(log.Ldate | log.Ltime | log.Llongfile)
 
-	conf, err := domain.GetConfig()
+	conf, err := config.Get()
 	if err != nil {
 		log.Fatalf("error reading config: %v", err)
 	}
-	ctx = context.WithValue(ctx, domain.ContextKey("config"), conf)
 
-	srv := NewDoHServer(ctx)
+	srv, err := NewDoHServer(ctx, conf)
+	if err != nil {
+		log.Fatalf("error creating server: %v", err)
+	}
 	if conf.Debug {
-		log.Printf("%#v", *conf)
-		log.Printf("%#v", *srv)
+		log.Printf("%#v", conf)
 	}
 
 	srv.Start()
@@ -36,4 +37,5 @@ func main() {
 	}
 
 	signal.Stop(signalChan)
+	log.Println("Exiting...")
 }

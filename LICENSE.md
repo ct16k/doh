@@ -1,4 +1,4 @@
-Copyright (c) 2019, Theodor-Iulian Ciobanu
+Copyright (c) 2019-2023, Theodor-Iulian Ciobanu
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
