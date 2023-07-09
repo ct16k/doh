@@ -3,9 +3,12 @@ package dns
 import (
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
@@ -14,14 +17,14 @@ import (
 type connKey [2]string
 
 type dnsConn struct {
-	open atomic.Int32
 	idle chan *dns.Conn
+	open atomic.Int32
 }
 
 type ConnPool struct {
-	connLock     sync.Mutex
 	idleConn     map[connKey]*dnsConn
 	reqChan      chan *dnsConn
+	connLock     sync.Mutex
 	open         atomic.Int32
 	idle         atomic.Int32
 	maxOpen      int32
@@ -86,13 +89,19 @@ func (p *ConnPool) Stop() error {
 
 	var errs []error
 	for k, l := range p.idleConn {
-		for c := range l.idle {
-			if c != nil {
-				if err := c.Close(); err != nil {
-					errs = append(errs, err)
+	DRAINLOOP:
+		for {
+			select {
+			case c := <-l.idle:
+				if c != nil {
+					if err := c.Close(); err != nil {
+						errs = append(errs, err)
+					}
 				}
+			default:
+				close(l.idle)
+				break DRAINLOOP
 			}
-			close(l.idle)
 		}
 		delete(p.idleConn, k)
 	}
@@ -103,33 +112,74 @@ func (p *ConnPool) Stop() error {
 func (p *ConnPool) Get(network, addr string) (*dns.Conn, error) {
 	l := p.getConnList(connKey{network, addr})
 
-	select {
-	case c, more := <-l.idle: // retrieve an idle connection
-		if !more {
-			return nil, fmt.Errorf("channel closed")
-		}
-		p.idle.Add(-1)
-		if c == nil {
-			return dns.Dial(network, addr)
-		}
+	for {
+		select {
+		case c, more := <-l.idle: // retrieve an idle connection
+			if !more {
+				return nil, fmt.Errorf("channel closed")
+			}
+			p.idle.Add(-1)
+			if c == nil {
+				return dns.Dial(network, addr)
+			}
 
-		return c, nil
-	default:
-		p.reqChan <- l      // request a new connection
-		c, more := <-l.idle // wait for a connection to become available
-		if !more {
-			return nil, fmt.Errorf("channel closed")
+			if err := p.connCheck(c); err != nil {
+				log.Printf("closing bad idle connection %s://%s: %v", network, addr, err)
+				l.open.Add(-1)
+				p.open.Add(-1)
+				if err = c.Close(); err != nil {
+					log.Printf("error closing connection %s://%s: %v", network, addr, err)
+				}
+
+				continue
+			}
+			return c, nil
+		default:
+			p.reqChan <- l      // request a new connection
+			c, more := <-l.idle // wait for a connection to become available
+			if !more {
+				return nil, fmt.Errorf("channel closed")
+			}
+			p.idle.Add(-1)
+			if c == nil {
+				return dns.Dial(network, addr)
+			}
+
+			if err := p.connCheck(c); err != nil {
+				log.Printf("closing bad idle connection %s://%s: %v", network, addr, err)
+				l.open.Add(-1)
+				p.open.Add(-1)
+				if err = c.Close(); err != nil {
+					log.Printf("error closing connection %s://%s: %v", network, addr, err)
+				}
+
+				continue
+			}
+			return c, nil
 		}
-		p.idle.Add(-1)
-		if c == nil {
-			return dns.Dial(network, addr)
-		}
-		return c, nil
 	}
 }
 
 func (p *ConnPool) Put(c *dns.Conn) error {
-	l := p.getConnList(connKey{c.RemoteAddr().Network(), c.RemoteAddr().String()})
+	network := c.RemoteAddr().Network()
+	addr := c.RemoteAddr().String()
+	l := p.getConnList(connKey{network, addr})
+
+	if network == "udp" {
+		l.open.Add(-1)
+		p.open.Add(-1)
+		return c.Close()
+	}
+
+	if err := p.connCheck(c); err != nil {
+		l.open.Add(-1)
+		p.open.Add(-1)
+		if closeErr := c.Close(); closeErr != nil {
+			log.Printf("error closing bad idle connection %s://%s: %v", network, addr, closeErr)
+		}
+		return err
+	}
+
 	if p.idle.Load() >= p.maxIdle {
 		l.open.Add(-1)
 		p.open.Add(-1)
@@ -152,6 +202,14 @@ func (p *ConnPool) Put(c *dns.Conn) error {
 	}
 
 	return nil
+}
+
+func (p *ConnPool) Close(c *dns.Conn) error {
+	l := p.getConnList(connKey{c.RemoteAddr().Network(), c.RemoteAddr().String()})
+
+	l.open.Add(-1)
+	p.open.Add(-1)
+	return c.Close()
 }
 
 func (p *ConnPool) getConnList(addr connKey) *dnsConn {
@@ -185,4 +243,37 @@ func (p *ConnPool) newConnectionHandler(l *dnsConn) {
 		}
 		time.Sleep(p.pollInterval)
 	}
+}
+
+func (p *ConnPool) connCheck(conn *dns.Conn) error {
+	rc, err := conn.Conn.(syscall.Conn).SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	var sysErr error = nil
+	err = rc.Read(func(fd uintptr) bool {
+		buf := []byte{0}
+		var n int
+
+		n, err = syscall.Read(syscall.Handle(fd), buf)
+		switch {
+		case n == 0 && err == nil:
+			sysErr = io.EOF
+		case n > 0:
+			sysErr = syscall.ERANGE
+		case err == syscall.EAGAIN || err == syscall.EWOULDBLOCK:
+			sysErr = nil
+		default:
+			sysErr = err
+		}
+
+		return true
+	})
+
+	if err != nil {
+		return err
+	}
+
+	return sysErr
 }

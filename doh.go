@@ -41,8 +41,8 @@ type DoHServer struct {
 	conf          *config.DoHServer
 	httpSemaphore *semaphore.Weighted
 	dnsClient     *dns.Client
-	wgServers     sync.WaitGroup
 	servers       []HTTPServer
+	wgServers     sync.WaitGroup
 }
 
 func NewDoHServer(ctx context.Context, conf *config.DoHServer) (*DoHServer, error) {
@@ -163,16 +163,16 @@ func (s *DoHServer) Stop() {
 	s.wgServers.Wait()
 	log.Println("Server stopped.")
 
-	s.dnsClient.Stop()
+	if err := s.dnsClient.Stop(); err != nil {
+		log.Printf("Error stopping DNS client: %v\n", err)
+	}
 	log.Println("DNS client stopped.")
 }
 
 func (s *DoHServer) requestHandler(w http.ResponseWriter, r *http.Request) {
-	var err error
-
 	if ok := s.httpSemaphore.TryAcquire(1); !ok {
 		log.Print("semaphore limit exceeded")
-		http.Error(w, err.Error(), http.StatusTooManyRequests)
+		http.Error(w, "semaphore limit exceeded", http.StatusTooManyRequests)
 		return
 	}
 	defer s.httpSemaphore.Release(1)

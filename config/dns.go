@@ -7,7 +7,7 @@ import (
 
 // systemConfig is copied from net/dnsconfig.go to be used by getSystemConfig()
 //
-//nolint:unused // only servers is field is used, but all fields are needed to match function signature
+//nolint:unused // only servers field is used, but all fields are needed to match function signature
 type systemConfig struct {
 	servers       []string      // server addresses (in host:port form) to use
 	search        []string      // rooted suffixes to append to local name

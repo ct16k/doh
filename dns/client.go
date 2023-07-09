@@ -78,7 +78,11 @@ func NewClient(ctx context.Context, conf *config.DoHServer) (*Client, error) {
 func (c *Client) Start() {
 }
 
-func (c *Client) Stop() {
+func (c *Client) Stop() error {
+	if err := c.connPool.Stop(); err != nil {
+		return fmt.Errorf("connection pool: %w", err)
+	}
+	return nil
 }
 
 func (c *Client) Query(ctx context.Context, reqID RequestID, clientIP net.IP, msg *dns.Msg) (*dns.Msg, error) {
@@ -165,7 +169,7 @@ func (c *Client) Query(ctx context.Context, reqID RequestID, clientIP net.IP, ms
 		}
 	}()
 
-	rrMsg, _, err := client.ExchangeWithConn(msg, conn)
+	rrMsg, _, err := client.ExchangeWithConnContext(ctx, msg, conn)
 	if err != nil {
 		return nil, fmt.Errorf("could not query %s: %w", resolver.Addr, err)
 	}
