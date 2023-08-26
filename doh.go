@@ -13,7 +13,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math"
 	"math/big"
 	"net"
@@ -39,20 +39,22 @@ type HTTPServer struct {
 type DoHServer struct {
 	ctx           context.Context
 	conf          *config.DoHServer
+	logger        *slog.Logger
 	httpSemaphore *semaphore.Weighted
 	dnsClient     *dns.Client
 	servers       []HTTPServer
 	wgServers     sync.WaitGroup
 }
 
-func NewDoHServer(ctx context.Context, conf *config.DoHServer) (*DoHServer, error) {
-	dnsClient, err := dns.NewClient(ctx, conf)
+func NewDoHServer(ctx context.Context, conf *config.DoHServer, logger *slog.Logger) (*DoHServer, error) {
+	dnsClient, err := dns.NewClient(ctx, conf, logger)
 	if err != nil {
 		return nil, fmt.Errorf("dns client: %w", err)
 	}
 	dohServer := &DoHServer{
 		ctx:           ctx,
 		conf:          conf,
+		logger:        logger,
 		httpSemaphore: semaphore.NewWeighted(conf.HTTPWorkers),
 		dnsClient:     dnsClient,
 	}
@@ -80,8 +82,7 @@ func NewDoHServer(ctx context.Context, conf *config.DoHServer) (*DoHServer, erro
 			caCertPool := x509.NewCertPool()
 			ok := caCertPool.AppendCertsFromPEM(caCerts)
 			if !ok {
-				return nil, fmt.Errorf("could not load CA certs from %s",
-					listenAddr.ClientCAs)
+				return nil, fmt.Errorf("could not load CA certs from %s", listenAddr.ClientCAs)
 			}
 
 			tlsConfig = tls.Config{
@@ -97,8 +98,8 @@ func NewDoHServer(ctx context.Context, conf *config.DoHServer) (*DoHServer, erro
 				hostname = listenAddr.Addr
 			}
 
-			tlsCert, err := dohServer.generateSelfSignedCert(hostname,
-				listenAddr.KeyFile, time.Now(), 10*365*24*time.Hour)
+			tlsCert, err := dohServer.generateSelfSignedCert(hostname, listenAddr.KeyFile, time.Now(),
+				10*365*24*time.Hour)
 			if err != nil {
 				return nil, fmt.Errorf("generate self-signed cert: %w", err)
 			}
@@ -109,9 +110,7 @@ func NewDoHServer(ctx context.Context, conf *config.DoHServer) (*DoHServer, erro
 
 		if tlsConfigSet {
 			server.TLSConfig = &tlsConfig
-			if conf.Debug {
-				log.Printf("Using TLS config: %#v", &tlsConfig)
-			}
+			logger.Debug("using TLS", "tlsConfig", &tlsConfig)
 		}
 
 		dohServer.servers = append(dohServer.servers, HTTPServer{
@@ -126,70 +125,72 @@ func NewDoHServer(ctx context.Context, conf *config.DoHServer) (*DoHServer, erro
 
 func (s *DoHServer) Start() {
 	s.dnsClient.Start()
-	log.Printf("DNS client started with resolvers: %v", s.conf.DNSResolvers)
+	s.logger.Info("DNS client started", "resolvers", s.conf.DNSResolvers)
 
 	for _, srv := range s.servers {
 		s.wgServers.Add(1)
 		go func(srv HTTPServer) {
 			defer s.wgServers.Done()
 
+			logger := s.logger.With("addr", srv.server.Addr)
 			var err error
 			if srv.certFile == "" {
-				log.Printf("Starting %s HTTP server...\n", srv.server.Addr)
+				logger.Info("Starting HTTP server")
 				err = srv.server.ListenAndServe()
 			} else if strings.HasPrefix(srv.certFile, "self:") {
-				log.Printf("Starting %s HTTPS self-signed listener...\n", srv.server.Addr)
+				logger.Info("Starting HTTPS self-signed listener")
 				err = srv.server.ListenAndServeTLS("", "")
 			} else {
-				log.Printf("Starting %s HTTPS listener...\n", srv.server.Addr)
+				logger.Info("Starting HTTPS listener")
 				err = srv.server.ListenAndServeTLS(srv.certFile, srv.keyFile)
 			}
 			if err != http.ErrServerClosed {
-				log.Fatalf("error starting server %s: %v", srv.server.Addr, err)
+				panic(fmt.Errorf("error starting server %s: %v", srv.server.Addr, err))
 			}
 		}(srv)
 	}
 
-	log.Println("Service started.")
+	s.logger.Info("Service started")
 }
 
 func (s *DoHServer) Stop() {
 	for _, srv := range s.servers {
-		log.Printf("Stopping %s server...\n", srv.server.Addr)
+		logger := s.logger.With("addr", srv.server.Addr)
+		logger.Info("Stopping server")
 		if err := srv.server.Shutdown(s.ctx); err != nil {
-			log.Printf("Error stopping service: %v\n", err)
+			logger.Error("Stopping server", "error", err)
 		}
 	}
 	s.wgServers.Wait()
-	log.Println("Server stopped.")
+	s.logger.Info("Servers stopped")
 
 	if err := s.dnsClient.Stop(); err != nil {
-		log.Printf("Error stopping DNS client: %v\n", err)
+		s.logger.Error("Stopping DNS client", "error", err)
 	}
-	log.Println("DNS client stopped.")
+	s.logger.Info("DNS client stopped")
 }
 
 func (s *DoHServer) requestHandler(w http.ResponseWriter, r *http.Request) {
 	if ok := s.httpSemaphore.TryAcquire(1); !ok {
-		log.Print("semaphore limit exceeded")
+		s.logger.Error("semaphore limit exceeded")
 		http.Error(w, "semaphore limit exceeded", http.StatusTooManyRequests)
 		return
 	}
 	defer s.httpSemaphore.Release(1)
 
 	reqID := dns.NewRequestID()
+	logger := s.logger.With("trace-id", reqID)
 	w.Header().Add("X-Trace-ID", reqID.String())
 
 	clientIP, err := s.getClientIPAddress(r)
 	if err != nil {
-		log.Printf("[%v] client ip error: %v", reqID, err)
+		logger.Error("get client ip address", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	logger = logger.With("client-ip", clientIP)
 
-	if s.conf.Debug {
-		log.Printf("[%v] %v: %#v", reqID, clientIP, r)
-	}
+	logger.Debug("serving request", "req", r)
 
 	found := false
 CONTENTTYPE_LOOP:
@@ -251,7 +252,7 @@ CONTENTTYPE_LOOP:
 
 	resp, err := s.dnsClient.QueryPackedMsg(r.Context(), reqID, clientIP, body)
 	if err != nil {
-		log.Printf("[%v] query error: %v", reqID, err)
+		logger.Error("DNS query", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -266,9 +267,9 @@ CONTENTTYPE_LOOP:
 	respHeaders.Set("Content-Length", strconv.Itoa(msgLen))
 	n, err := w.Write(resp.Msg)
 	if err != nil {
-		log.Printf("[%v] could not reply: %v", reqID, err)
+		logger.Error("could not reply", "error", err)
 	} else if n != msgLen {
-		log.Printf("[%v] incomplete response sent (%d/%d)", reqID, n, msgLen)
+		logger.Error("incomplete response sent", "msg-len", msgLen, "msg-sent", n)
 	}
 }
 

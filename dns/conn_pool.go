@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +22,7 @@ type dnsConn struct {
 }
 
 type ConnPool struct {
+	logger       *slog.Logger
 	idleConn     map[connKey]*dnsConn
 	reqChan      chan *dnsConn
 	connLock     sync.Mutex
@@ -34,7 +35,9 @@ type ConnPool struct {
 	pollInterval time.Duration
 }
 
-func NewConnPool(maxOpen, maxIdle, maxHostOpen, maxHostIdle int32, pollInterval time.Duration) (*ConnPool, error) {
+func NewConnPool(logger *slog.Logger, maxOpen, maxIdle, maxHostOpen, maxHostIdle int32,
+	pollInterval time.Duration,
+) (*ConnPool, error) {
 	if maxOpen < 1 {
 		return nil, fmt.Errorf("invalid number of total open connections: %d", maxOpen)
 	}
@@ -63,6 +66,7 @@ func NewConnPool(maxOpen, maxIdle, maxHostOpen, maxHostIdle int32, pollInterval 
 	}
 
 	connPool := &ConnPool{
+		logger:       logger,
 		idleConn:     make(map[connKey]*dnsConn),
 		reqChan:      make(chan *dnsConn, maxOpen),
 		maxOpen:      maxOpen,
@@ -111,6 +115,7 @@ func (p *ConnPool) Stop() error {
 
 func (p *ConnPool) Get(network, addr string) (*dns.Conn, error) {
 	l := p.getConnList(connKey{network, addr})
+	logger := p.logger.With("addr", fmt.Sprintf("%s://%s", network, addr))
 
 	for {
 		select {
@@ -124,11 +129,11 @@ func (p *ConnPool) Get(network, addr string) (*dns.Conn, error) {
 			}
 
 			if err := p.connCheck(c); err != nil {
-				log.Printf("closing bad idle connection %s://%s: %v", network, addr, err)
+				logger.Warn("closing bad idle connection", "error", err)
 				l.open.Add(-1)
 				p.open.Add(-1)
 				if err = c.Close(); err != nil {
-					log.Printf("error closing connection %s://%s: %v", network, addr, err)
+					logger.Error("closing connection", "error", err)
 				}
 
 				continue
@@ -146,11 +151,11 @@ func (p *ConnPool) Get(network, addr string) (*dns.Conn, error) {
 			}
 
 			if err := p.connCheck(c); err != nil {
-				log.Printf("closing bad idle connection %s://%s: %v", network, addr, err)
+				logger.Warn("closing bad idle connection", "error", err)
 				l.open.Add(-1)
 				p.open.Add(-1)
 				if err = c.Close(); err != nil {
-					log.Printf("error closing connection %s://%s: %v", network, addr, err)
+					logger.Error("closing connection", "error", err)
 				}
 
 				continue
@@ -164,6 +169,7 @@ func (p *ConnPool) Put(c *dns.Conn) error {
 	network := c.RemoteAddr().Network()
 	addr := c.RemoteAddr().String()
 	l := p.getConnList(connKey{network, addr})
+	logger := p.logger.With("addr", fmt.Sprintf("%s://%s", network, addr))
 
 	if network == "udp" {
 		l.open.Add(-1)
@@ -175,7 +181,7 @@ func (p *ConnPool) Put(c *dns.Conn) error {
 		l.open.Add(-1)
 		p.open.Add(-1)
 		if closeErr := c.Close(); closeErr != nil {
-			log.Printf("error closing bad idle connection %s://%s: %v", network, addr, closeErr)
+			logger.Error("closing connection", "error", closeErr)
 		}
 		return err
 	}

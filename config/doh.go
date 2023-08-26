@@ -3,7 +3,7 @@ package config
 import (
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"regexp"
 	"strconv"
@@ -24,7 +24,7 @@ type DoHServer struct {
 	ECS6PrefixLen int
 	ForceEDNS     bool
 	ForceECS      bool
-	Debug         bool
+	LogLevel      int
 }
 
 type ListenAddr struct {
@@ -82,7 +82,7 @@ func Get() (*DoHServer, error) {
 	flag.IntVar(&conf.ECS6PrefixLen, "ecs6Prefix", 56, "ECS IPv6 source prefix length")
 	flag.StringVar(&connPool, "connPool", "10000,1000,1000,100,100ms",
 		"Connection pool configuration, specified as <maxOpen>,<maxIdle>,<maxHostOpen>,<maxHostIdle>,<pollInterval>")
-	flag.BoolVar(&conf.Debug, "debug", false, "Show debug info")
+	flag.IntVar(&conf.LogLevel, "logLevel", int(slog.LevelInfo), "Set log level")
 
 	flag.Parse()
 
@@ -262,7 +262,7 @@ func Get() (*DoHServer, error) {
 
 		for _, addr := range systemConfig.servers {
 			if _, ok := addrs[addr]; ok {
-				log.Printf("duplicate resolver: %s", addr)
+				slog.Error("duplicate resolver", "addr", addr)
 				continue
 			}
 			addrs[addr] = struct{}{}

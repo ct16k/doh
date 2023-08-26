@@ -3,7 +3,7 @@ package dns
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 	_ "unsafe"
@@ -29,6 +29,7 @@ func NewRequestID() RequestID {
 type Client struct {
 	ctx           context.Context
 	conf          *config.DoHServer
+	logger        *slog.Logger
 	msgPool       sync.Pool
 	clientPool    sync.Pool
 	connPool      *ConnPool
@@ -45,15 +46,16 @@ type Response struct {
 //go:linkname fastRandN runtime.fastrandn
 func fastRandN(n uint32) uint32
 
-func NewClient(ctx context.Context, conf *config.DoHServer) (*Client, error) {
-	connPool, err := NewConnPool(conf.ConnPool.MaxOpen, conf.ConnPool.MaxIdle, conf.ConnPool.MaxHostOpen,
+func NewClient(ctx context.Context, conf *config.DoHServer, logger *slog.Logger) (*Client, error) {
+	connPool, err := NewConnPool(logger, conf.ConnPool.MaxOpen, conf.ConnPool.MaxIdle, conf.ConnPool.MaxHostOpen,
 		conf.ConnPool.MaxHostIdle, conf.ConnPool.PollInterval)
 	if err != nil {
 		return nil, fmt.Errorf("connection pool: %w", err)
 	}
 	dnsClient := &Client{
-		ctx:  ctx,
-		conf: conf,
+		ctx:    ctx,
+		conf:   conf,
+		logger: logger,
 		msgPool: sync.Pool{
 			New: func() any {
 				return &dns.Msg{}
@@ -88,9 +90,8 @@ func (c *Client) Stop() error {
 func (c *Client) Query(ctx context.Context, reqID RequestID, clientIP net.IP, msg *dns.Msg) (*dns.Msg, error) {
 	msgID := msg.Id
 	msg.Id = reqID[0]
-	if c.conf.Debug {
-		log.Printf("[%v] orig %x: %#v", reqID, msgID, msg)
-	}
+	logger := c.logger.With("trace-id", reqID, "msg-id", msgID)
+	logger.Debug("query", "msg", msg)
 
 	optRR := msg.IsEdns0()
 	if (optRR == nil) && c.conf.ForceEDNS {
@@ -155,9 +156,7 @@ func (c *Client) Query(ctx context.Context, reqID RequestID, clientIP net.IP, ms
 
 	resolver := c.resolvers[fastRandN(c.resolverCount)]
 	client.Net = resolver.Net
-	if c.conf.Debug {
-		log.Printf("[%v] req %x to %v: %#v", reqID, msgID, resolver, msg)
-	}
+	logger.Debug("request", "resolver", resolver, "msg", msg)
 
 	conn, err := c.connPool.Get(resolver.Net, resolver.Addr)
 	if err != nil {
@@ -165,7 +164,7 @@ func (c *Client) Query(ctx context.Context, reqID RequestID, clientIP net.IP, ms
 	}
 	defer func() {
 		if err = c.connPool.Put(conn); err != nil {
-			log.Printf("error putting connection %v back into cache: %v", resolver, err)
+			logger.Error("putting connection back into cache", "resolver", resolver, "error", err)
 		}
 	}()
 
@@ -173,9 +172,7 @@ func (c *Client) Query(ctx context.Context, reqID RequestID, clientIP net.IP, ms
 	if err != nil {
 		return nil, fmt.Errorf("could not query %s: %w", resolver.Addr, err)
 	}
-	if c.conf.Debug {
-		log.Printf("[%v] resp %x: %#v", reqID, msgID, rrMsg)
-	}
+	logger.Debug("response", "rrMsg", rrMsg)
 
 	rrMsg.Id = msgID
 

@@ -4,11 +4,8 @@ This is a bare bones DNS over HTTPS proxy that listens for requests over DoH and
 ## Usage
 ```
 Usage of doh:
-Usage of D:\Projects\doh\doh.exe:
   -connPool string
         Connection pool configuration, specified as <maxOpen>,<maxIdle>,<maxHostOpen>,<maxHostIdle>,<pollInterval> (default "10000,1000,1000,100,100ms")
-  -debug
-        Show debug info
   -ecs4Prefix int
         ECS IPv4 source prefix length (default 24)
   -ecs6Prefix int
@@ -23,6 +20,8 @@ Usage of D:\Projects\doh\doh.exe:
         Semicolon separated list of upstream proxies trusted to send valid client IP address
   -listen string
         Semicolon separated list of addresses to listen on for incoming connections; to enable TLS use <addr:port>,<cert>,<key>[,clientCAs] instead (default "127.0.0.1:8053")
+  -logLevel int
+        Set log level
   -proxyHeader string
         Request header whose value will be checked for the client address (default "Forwarded")
   -resolvers string

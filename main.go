@@ -2,29 +2,39 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 
 	"doh/config"
 )
 
-func main() {
-	ctx := context.Background()
-	log.SetFlags(log.Ldate | log.Ltime | log.Llongfile)
+var startProfiling, stopProfiling func()
 
+func main() {
 	conf, err := config.Get()
 	if err != nil {
-		log.Fatalf("error reading config: %v", err)
+		slog.Error("reading config", "error", err)
+		return
 	}
 
-	srv, err := NewDoHServer(ctx, conf)
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		AddSource: true,
+		Level:     slog.Level(conf.LogLevel),
+	}))
+	slog.SetDefault(logger)
+
+	if startProfiling != nil {
+		startProfiling()
+	}
+
+	srv, err := NewDoHServer(ctx, conf, logger)
 	if err != nil {
-		log.Fatalf("error creating server: %v", err)
+		logger.Error("error creating server", "error", err)
+		return
 	}
-	if conf.Debug {
-		log.Printf("%#v", conf)
-	}
+	logger.Debug("running with config", "conf", conf)
 
 	srv.Start()
 
@@ -37,5 +47,9 @@ func main() {
 	}
 
 	signal.Stop(signalChan)
-	log.Println("Exiting...")
+	logger.Info("Exiting...")
+
+	if stopProfiling != nil {
+		stopProfiling()
+	}
 }
