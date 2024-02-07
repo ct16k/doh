@@ -42,6 +42,7 @@ type DoHServer struct {
 	logger        *slog.Logger
 	httpSemaphore *semaphore.Weighted
 	dnsClient     *dns.Client
+	bufPool       sync.Pool
 	servers       []HTTPServer
 	wgServers     sync.WaitGroup
 }
@@ -57,6 +58,11 @@ func NewDoHServer(ctx context.Context, conf *config.DoHServer, logger *slog.Logg
 		logger:        logger,
 		httpSemaphore: semaphore.NewWeighted(conf.HTTPWorkers),
 		dnsClient:     dnsClient,
+		bufPool: sync.Pool{
+			New: func() any {
+				return make([]byte, 1<<16)
+			},
+		},
 	}
 
 	mux := http.NewServeMux()
@@ -250,7 +256,9 @@ CONTENTTYPE_LOOP:
 		return
 	}
 
-	resp, err := s.dnsClient.QueryPackedMsg(r.Context(), reqID, clientIP, body)
+	buf := s.bufPool.Get()
+	defer s.bufPool.Put(buf)
+	resp, err := s.dnsClient.QueryPackedMsg(r.Context(), reqID, clientIP, body, buf.([]byte))
 	if err != nil {
 		logger.Error("DNS query", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)

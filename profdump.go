@@ -22,7 +22,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
-//go:build profdump
+// go:build profdump
 
 package main
 
@@ -30,6 +30,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
@@ -40,6 +41,7 @@ import (
 
 func init() {
 	var (
+		httpprofile  = flag.Bool("httpprofile", false, "start runtime profiling data server")
 		cpuprofile   = flag.Bool("cpuprofile", false, "write cpu profile")
 		goprofile    = flag.Int("goprofile", -1, "write goroutine profile")
 		heapprofile  = flag.Int("heapprofile", -1, "write heap profile")
@@ -80,6 +82,12 @@ func init() {
 			if err = pprof.StartCPUProfile(cpufile); err != nil {
 				slog.Error("could not start CPU profile", "error", err)
 			}
+		}
+
+		if *httpprofile {
+			go func() {
+				fmt.Println("profile server", http.ListenAndServe("127.0.0.1:6060", nil))
+			}()
 		}
 	}
 

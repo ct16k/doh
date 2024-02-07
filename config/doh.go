@@ -24,6 +24,7 @@ type DoHServer struct {
 	ECS6PrefixLen int
 	ForceEDNS     bool
 	ForceECS      bool
+	CacheSize     int
 	LogLevel      int
 }
 
@@ -82,6 +83,7 @@ func Get() (*DoHServer, error) {
 	flag.IntVar(&conf.ECS6PrefixLen, "ecs6Prefix", 56, "ECS IPv6 source prefix length")
 	flag.StringVar(&connPool, "connPool", "10000,1000,1000,100,100ms",
 		"Connection pool configuration, specified as <maxOpen>,<maxIdle>,<maxHostOpen>,<maxHostIdle>,<pollInterval>")
+	flag.IntVar(&conf.CacheSize, "cacheSize", 1024*1024, "In-memory cache size in bytes (512KiB minimum; 0 to disable)")
 	flag.IntVar(&conf.LogLevel, "logLevel", int(slog.LevelInfo), "Set log level")
 
 	flag.Parse()
@@ -170,6 +172,7 @@ func Get() (*DoHServer, error) {
 		}
 
 		if _, ok := addrs[strs]; ok {
+			flag.Usage()
 			return nil, fmt.Errorf("duplicate listen address: %s", strs)
 		}
 		addrs[strs] = struct{}{}
@@ -204,17 +207,20 @@ func Get() (*DoHServer, error) {
 
 		if strings.HasPrefix(addr, "_") {
 			if !conf.RFC7239Regexp.MatchString(addr) {
+				flag.Usage()
 				return nil, fmt.Errorf("invalid proxy: %s", addr)
 			}
 		} else {
 			ip := net.ParseIP(addr)
 			if ip == nil {
+				flag.Usage()
 				return nil, fmt.Errorf("invalid proxy: %s", addr)
 			}
 			addr = ip.String()
 		}
 
 		if _, ok := addrs[addr]; ok {
+			flag.Usage()
 			return nil, fmt.Errorf("duplicate proxy: %s", addr)
 		}
 
@@ -239,12 +245,14 @@ func Get() (*DoHServer, error) {
 		addr = fields[1]
 
 		if host, port, err := net.SplitHostPort(addr); err != nil {
+			flag.Usage()
 			return nil, fmt.Errorf("invalid resolver: %w", err)
 		} else {
 			addr = fmt.Sprintf("%s:%s", net.ParseIP(host).String(), port)
 		}
 
 		if _, ok := addrs[strs]; ok {
+			flag.Usage()
 			return nil, fmt.Errorf("duplicate resolver: %s", strs)
 		}
 		addrs[strs] = struct{}{}
@@ -257,6 +265,7 @@ func Get() (*DoHServer, error) {
 	if len(addrs) == 0 {
 		systemConfig := getSystemConfig()
 		if systemConfig.err != nil {
+			flag.Usage()
 			return nil, fmt.Errorf("could not read system resolvers: %w", systemConfig.err)
 		}
 
@@ -276,6 +285,11 @@ func Get() (*DoHServer, error) {
 	if len(addrs) == 0 {
 		flag.Usage()
 		return nil, fmt.Errorf("no resolvers to forward to")
+	}
+
+	if (conf.CacheSize != 0) && (conf.CacheSize < 512*1024) {
+		flag.Usage()
+		return nil, fmt.Errorf("invalid cache size")
 	}
 
 	return conf, nil

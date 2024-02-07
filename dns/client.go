@@ -2,14 +2,17 @@ package dns
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	_ "unsafe"
 
 	"doh/config"
 
+	"github.com/coocood/freecache"
 	"github.com/miekg/dns"
 )
 
@@ -33,6 +36,8 @@ type Client struct {
 	msgPool       sync.Pool
 	clientPool    sync.Pool
 	connPool      *ConnPool
+	cache         *freecache.Cache
+	cacheTimer    freecache.StoppableTimer
 	resolvers     []config.DNSResolver
 	resolverCount uint32
 }
@@ -71,6 +76,11 @@ func NewClient(ctx context.Context, conf *config.DoHServer, logger *slog.Logger)
 		connPool: connPool,
 	}
 
+	if conf.CacheSize > 0 {
+		dnsClient.cacheTimer = freecache.NewCachedTimer()
+		dnsClient.cache = freecache.NewCacheCustomTimer(conf.CacheSize, dnsClient.cacheTimer)
+	}
+
 	dnsClient.resolvers = conf.DNSResolvers[:]
 	dnsClient.resolverCount = uint32(len(dnsClient.resolvers))
 
@@ -84,15 +94,142 @@ func (c *Client) Stop() error {
 	if err := c.connPool.Stop(); err != nil {
 		return fmt.Errorf("connection pool: %w", err)
 	}
+
+	if c.cacheTimer != nil {
+		c.cacheTimer.Stop()
+	}
+
 	return nil
 }
 
-func (c *Client) Query(ctx context.Context, reqID RequestID, clientIP net.IP, msg *dns.Msg) (*dns.Msg, error) {
-	msgID := msg.Id
-	msg.Id = reqID[0]
-	logger := c.logger.With("trace-id", reqID, "msg-id", msgID)
+func (c *Client) Query(ctx context.Context, logger *slog.Logger, reqID RequestID, clientIP net.IP, msg *dns.Msg) (*dns.Msg, error) {
 	logger.Debug("query", "msg", msg)
 
+	client := c.clientPool.Get().(*dns.Client)
+	defer c.clientPool.Put(client)
+
+	resolver := c.resolvers[fastRandN(c.resolverCount)]
+	client.Net = resolver.Net
+	logger.Debug("request", "resolver", resolver, "msg", msg)
+
+	conn, err := c.connPool.Get(resolver.Net, resolver.Addr)
+	if err != nil {
+		return nil, fmt.Errorf("could not dial connection for %v: %w", resolver, err)
+	}
+
+	rrMsg, _, err := client.ExchangeWithConnContext(ctx, msg, conn)
+	if err != nil {
+		return nil, fmt.Errorf("could not query %s: %w", resolver.Addr, err)
+	}
+	logger.Debug("response", "rrMsg", rrMsg)
+
+	defer func() {
+		if err = c.connPool.Put(conn); err != nil {
+			logger.Error("putting connection back into cache", "resolver", resolver, "error", err)
+		}
+	}()
+
+	if rrMsg.Id != msg.Id {
+		return nil, fmt.Errorf("message ID mismatch: got %04x, expected %04x", rrMsg.Id, msg.Id)
+	}
+
+	return rrMsg, nil
+}
+
+func (c *Client) QueryPackedMsg(ctx context.Context, reqID RequestID, clientIP net.IP, msg []byte,
+	buf []byte,
+) (*Response, error) {
+	queryMsg := c.msgPool.Get().(*dns.Msg)
+	defer c.msgPool.Put(queryMsg)
+
+	err := queryMsg.Unpack(msg)
+	if err != nil {
+		return nil, fmt.Errorf("could not unpack query: %w", err)
+	}
+
+	msgID := queryMsg.Id
+	queryMsg.Id = reqID[0]
+	logger := c.logger.With("trace-id", reqID, "msg-id", msgID)
+
+	var cacheKeyBuilder strings.Builder
+	var cacheKey []byte
+	var resp []byte
+	var ttl uint32
+
+	if c.cache != nil {
+		if ecs := c.checkEDNS0(clientIP, queryMsg); ecs != nil {
+			cacheKeyBuilder.WriteString(ecs.String())
+		}
+
+		for _, q := range queryMsg.Question {
+			cacheKeyBuilder.WriteString(q.String())
+		}
+		cacheKey = []byte(cacheKeyBuilder.String())
+
+		resp, err = c.cache.Peek(cacheKey)
+		if err == nil {
+			ttl, err = c.cache.TTL(cacheKey)
+			binary.BigEndian.PutUint16(resp, msgID)
+			logger.Debug("cached response", "msg", resp)
+		}
+	}
+
+	if (c.cache == nil) || (err != nil) {
+		var rrMsg *dns.Msg
+		rrMsg, err = c.Query(ctx, logger, reqID, clientIP, queryMsg)
+		if err != nil {
+			return nil, err
+		}
+		rrMsg.Id = msgID
+
+		resp, err = rrMsg.PackBuffer(buf)
+		if err != nil {
+			return nil, fmt.Errorf("could not pack response: %w", err)
+		}
+
+		ttl = c.GetTTL(rrMsg)
+	}
+
+	if c.cache != nil {
+		if err = c.cache.Set(cacheKey, resp, int(ttl)); err != nil {
+			logger.Error("could not cache record", "key", string(cacheKey), "error", err)
+		}
+	}
+
+	return &Response{
+		Msg: resp,
+		TTL: ttl,
+	}, nil
+}
+
+func (c *Client) GetTTL(msg *dns.Msg) uint32 {
+	minTTL := uint32(1<<32 - 1)
+
+	for _, dnsRR := range msg.Ns {
+		ttl := dnsRR.Header().Ttl
+		if ttl < minTTL {
+			minTTL = ttl
+		}
+	}
+
+	for _, dnsRR := range msg.Answer {
+		ttl := dnsRR.Header().Ttl
+		if ttl < minTTL {
+			minTTL = ttl
+		}
+	}
+
+	for _, dnsRR := range msg.Extra {
+		ttl := dnsRR.Header().Ttl
+		if ttl < minTTL {
+			minTTL = ttl
+		}
+	}
+
+	return minTTL
+}
+
+func (c *Client) checkEDNS0(clientIP net.IP, msg *dns.Msg) *dns.EDNS0_SUBNET {
 	optRR := msg.IsEdns0()
 	if (optRR == nil) && c.conf.ForceEDNS {
 		optRR = &dns.OPT{
@@ -105,8 +242,8 @@ func (c *Client) Query(ctx context.Context, reqID RequestID, clientIP net.IP, ms
 		msg.Extra = append(msg.Extra, optRR)
 	}
 
+	var ecsOpt *dns.EDNS0_SUBNET
 	if optRR != nil {
-		var ecsOpt *dns.EDNS0_SUBNET
 		for _, option := range optRR.Option {
 			if option.Option() == dns.EDNS0SUBNET {
 				ecsOpt = option.(*dns.EDNS0_SUBNET)
@@ -151,82 +288,5 @@ func (c *Client) Query(ctx context.Context, reqID RequestID, clientIP net.IP, ms
 		}
 	}
 
-	client := c.clientPool.Get().(*dns.Client)
-	defer c.clientPool.Put(client)
-
-	resolver := c.resolvers[fastRandN(c.resolverCount)]
-	client.Net = resolver.Net
-	logger.Debug("request", "resolver", resolver, "msg", msg)
-
-	conn, err := c.connPool.Get(resolver.Net, resolver.Addr)
-	if err != nil {
-		return nil, fmt.Errorf("could not dial connection for %v: %w", resolver, err)
-	}
-	defer func() {
-		if err = c.connPool.Put(conn); err != nil {
-			logger.Error("putting connection back into cache", "resolver", resolver, "error", err)
-		}
-	}()
-
-	rrMsg, _, err := client.ExchangeWithConnContext(ctx, msg, conn)
-	if err != nil {
-		return nil, fmt.Errorf("could not query %s: %w", resolver.Addr, err)
-	}
-	logger.Debug("response", "rrMsg", rrMsg)
-
-	rrMsg.Id = msgID
-
-	return rrMsg, nil
-}
-
-func (c *Client) QueryPackedMsg(ctx context.Context, reqID RequestID, clientIP net.IP, msg []byte) (*Response, error) {
-	queryMsg := c.msgPool.Get().(*dns.Msg)
-	defer c.msgPool.Put(queryMsg)
-
-	err := queryMsg.Unpack(msg)
-	if err != nil {
-		return nil, fmt.Errorf("could not unpack query: %w", err)
-	}
-
-	rrMsg, err := c.Query(ctx, reqID, clientIP, queryMsg)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := rrMsg.Pack()
-	if err != nil {
-		return nil, fmt.Errorf("could not pack response: %w", err)
-	}
-
-	return &Response{
-		Msg: resp,
-		TTL: c.GetTTL(rrMsg),
-	}, nil
-}
-
-func (c *Client) GetTTL(msg *dns.Msg) uint32 {
-	minTTL := uint32(1<<32 - 1)
-
-	for _, dnsRR := range msg.Ns {
-		ttl := dnsRR.Header().Ttl
-		if ttl < minTTL {
-			minTTL = ttl
-		}
-	}
-
-	for _, dnsRR := range msg.Answer {
-		ttl := dnsRR.Header().Ttl
-		if ttl < minTTL {
-			minTTL = ttl
-		}
-	}
-
-	for _, dnsRR := range msg.Extra {
-		ttl := dnsRR.Header().Ttl
-		if ttl < minTTL {
-			minTTL = ttl
-		}
-	}
-
-	return minTTL
+	return ecsOpt
 }

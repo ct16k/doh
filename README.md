@@ -35,6 +35,7 @@ Usage of doh:
 * DoH client
 * proxy protocol support
 * better (env/file?) config
+* cache-control request header support
 * rate limiting
 * tests!
 
