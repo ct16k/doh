@@ -276,7 +276,6 @@ func (p *ConnPool) connCheck(conn *dns.Conn) error {
 
 		return true
 	})
-
 	if err != nil {
 		return err
 	}
